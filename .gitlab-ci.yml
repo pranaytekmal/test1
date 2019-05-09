@@ -1,0 +1,156 @@
+image: cypress/base:10
+
+services:
+  - docker:dind
+
+cache:
+  paths:
+  - node_modules/
+  
+variables:
+  DOCKER_DRIVER: overlay
+  DOCKER_HOST: tcp://127.0.0.1:2375
+  
+stages:
+  - install dependencies
+  - compile
+  - Test Unit
+  - Build and Push Image
+  - deploy
+  
+# single macro use in dev, qa, prod stage
+.common_compile: &common_compile
+  stage: compile
+  tags:
+    - TMS
+  script:
+    - npm config set strict-ssl false
+    - API_ROOT=$API_ROOT_variable
+    - npm run build
+  artifacts: # share build arifacts to next stage, expire time will be 2 hr
+      expire_in: 2h
+      paths:
+      - nginx-conf
+      - build
+#macro for build docker image and store in gitlab registory
+#use in dev, qa, prod docker build stage
+.common_docker_build: &common_docker_build
+  stage: Build and Push Image
+  image: docker:dind
+  tags:
+    - TMS
+  script:
+    # docker login with user credentials who ran the pipeline
+    - docker login -u ${GITLAB_USER_EMAIL} -p ${CI_DOCKER_TOKEN} registry.gitlab.torq.trans.apps.ge.com
+    # build docker image as per docker file in same repo and push to registory
+    - docker build -t registry.gitlab.torq.trans.apps.ge.com/tl/tms-modernization/tms-ui/deployable-ui:${DOCKER_TAG} .
+    - docker push registry.gitlab.torq.trans.apps.ge.com/tl/tms-modernization/tms-ui/deployable-ui:${DOCKER_TAG}
+
+# this is initial stage to get dependent node modue  
+install dependencies:
+    stage: install dependencies
+    tags:
+      - TMS
+    script:
+    - npm config set strict-ssl false
+    # set token  in netr, need this becauuse installing dependent package form diffrent project (ge-ui)
+    - echo -e "machine gitlab.torq.trans.apps.ge.com\nlogin gitlab-ci-token\npassword ${CI_JOB_TOKEN}" > ~/.netrc
+    # install packages as per package.json
+    - npm install
+    # install package as per ge-ui
+    - npm install git+https://gitlab.torq.trans.apps.ge.com/tl/TMS-Modernization/ge-ui.git#semver:^1.16.2
+    - npm ci
+    when: manual
+    artifacts:
+      expire_in: 2h
+      paths:
+      - node_modules
+
+# this stage use to deploy to kubernetes      
+deploy helm:
+    stage: deploy
+    image: dtzar/helm-kubectl # used this image as it contains kubernetes and helm configured already
+    tags:
+      - TMS
+    script:
+      #set up kubectl
+      - mkdir -p $HOME/.kube
+      - export KUBECONFIG=$HOME/.kube/config
+      #get  kube_config variable form CI-CD variable and configure in kubeconfig
+      - echo ${kube_config} | base64 -d >${KUBECONFIG}
+      #set kubectl context
+      - kubectl config use-context cdfde3ea-60e4-4485-a40b-9bc06cbf80f6
+      # gettting all namespaces form cluster (only for to test kubectl configure well)
+      - kubectl get all --namespace=gitlab-runner
+      #un-comment below line to deploy kubernetes with help of helm
+      #- ./scripts/helm-deploy.sh
+    when: manual
+
+#prod compile stage run only for master branch 
+compile prod:
+  <<: *common_compile
+  when: manual
+  only:
+  - master
+  variables:
+    API_ROOT_variable: https://prod.rail.tms.nonprod.torq.trans.apps.ge.com/monoapp/api/v1
+
+#qa compile stage run only for qa branch 
+compile qa:
+  <<: *common_compile
+  when: manual
+  only:
+  - qa
+  variables:
+    API_ROOT_variable: https://qa.rail.tms.nonprod.torq.trans.apps.ge.com/monoapp/api/v1
+
+#dev compile stage run only for dev branch 
+compile dev:
+  <<: *common_compile
+  when: manual
+  except:
+  - qa
+  - master
+  variables:
+    API_ROOT_variable: "https://dev.rail.tms.nonprod.torq.trans.apps.ge.com/monoapp/api/v1"
+
+# this stage is showing code covrage in pipeline console
+Test Unit coverage:
+    stage: Test Unit
+    when: manual
+    script:
+    - npm -v
+    - npm config set strict-ssl false
+    - API_ROOT="https://dev.rail.tms.nonprod.torq.trans.apps.ge.com/monoapp/api/v1"
+    - npm run test:coverage
+
+# docker build stage use  common_docker_build macro and run only for master
+#docker image tag picked as per provided in variable
+docker prod:
+  <<: *common_docker_build
+  when: manual
+  only:
+  - master
+  variables:
+    DOCKER_TAG: "$docker_image_tag"
+
+# docker build stage use common_docker_build macro and run only for qa
+#docker image tag picked as per provided in variable
+docker qa:
+  <<: *common_docker_build
+  when: manual
+  only:
+  - qa
+  variables:
+    DOCKER_TAG: "$docker_image_tag"
+
+# docker build stage use  common_docker_build macro and run only for dev
+#docker image tag picked as per provided in variable
+docker dev:
+  when: manual
+  <<: *common_docker_build
+  except:
+  - qa
+  - master
+  variables:
+    DOCKER_TAG: "$docker_image_tag"
